@@ -1,432 +1,235 @@
 /*
- * ================================================================
- * DUAL AXIS SOLAR TRACKER - ESP32
- * Improved firmware for 4 LDR + 2 positional SG90 servos
- * ================================================================
- *
- * Hardware (classic ESP32):
- *   LDR TL -> GPIO34
- *   LDR TR -> GPIO35
- *   LDR BL -> GPIO32
- *   LDR BR -> GPIO33
- *
- *   Pan servo  -> GPIO18
- *   Tilt servo -> GPIO19
- *
- * LDR divider assumed:
- *   3.3V -> LDR -> ADC node -> 10k resistor -> GND
- *   Brighter light should produce a HIGHER ADC reading.
- *
- * Servo power:
- *   Use a separate regulated 5V supply with sufficient current.
- *   Connect external supply GND to ESP32 GND.
- *
- * Features:
- *   - 12-bit ADC
- *   - Median-of-5 sampling per LDR
- *   - EMA low-pass filtering
- *   - Auto-calibration disabled (gain = 1.0 initially)
- *   - Normalized horizontal/vertical light error
- *   - Low-light / invalid-signal hold
- *   - P-only velocity controller for initial safe tuning
- *   - Servo speed and angle limits
- *   - Arduino ESP32 Core 2.x / 3.x LEDC compatibility
- *
- * IMPORTANT:
- *   1. Test sensor readings first with servos disconnected.
- *   2. Test one servo axis at a time.
- *   3. Verify PAN_DIRECTION and TILT_DIRECTION before unattended use.
- *   4. Adjust pulse limits for your actual servo/mechanics.
- * ================================================================
- */
+  DUAL AXIS SOLAR TRACKER V2 - ESP32 classic + 4 LDR + 2 SG90
+  Requires Arduino-ESP32 Core 2.x or 3.x (no ESP32Servo dependency).
 
+  LDR wiring assumed: 3.3V -- LDR -- ADC pin -- 10k resistor -- GND
+  More light -> higher ADC. Change wiring/logic if yours differs.
+
+  PAN GPIO18, TILT GPIO19
+  TL GPIO34, TR GPIO35, BL GPIO32, BR GPIO33
+  Servo supply: external regulated 5V, common GND with ESP32.
+
+  CONTROL: normalized optical error -> P velocity -> integrate to servo angle.
+  This is NOT a conventional PID controller.
+*/
 #include <Arduino.h>
 #include <math.h>
+#include <esp_arduino_version.h>
 
-// ------------------------------------------------
-// 1. PIN CONFIGURATION
-// ------------------------------------------------
-#define PIN_LDR_TL       34
-#define PIN_LDR_TR       35
-#define PIN_LDR_BL       32
-#define PIN_LDR_BR       33
+constexpr uint8_t LDR_PINS[4] = {34, 35, 32, 33}; // TL TR BL BR
+constexpr uint8_t PAN_PIN = 18, TILT_PIN = 19;
+constexpr uint8_t PAN_CHANNEL = 0, TILT_CHANNEL = 1;
+constexpr uint32_t PWM_FREQ = 50;
+constexpr uint8_t PWM_BITS = 13;
+constexpr float PWM_PERIOD_US = 20000.0f;
+constexpr uint32_t PWM_MAX_DUTY = (1UL << PWM_BITS) - 1;
 
-#define PIN_SERVO_PAN    18
-#define PIN_SERVO_TILT   19
+// ---- Adjustable settings ----
+constexpr float PAN_HOME = 90.0f, TILT_HOME = 90.0f;
+constexpr float PAN_MIN = 20.0f, PAN_MAX = 160.0f;
+constexpr float TILT_MIN = 20.0f, TILT_MAX = 160.0f;
+constexpr float PULSE_MIN_US = 1000.0f, PULSE_MAX_US = 2000.0f;
 
-#define CH_SERVO_PAN     0
-#define CH_SERVO_TILT    1
+// Verify these signs physically. If the servo moves AWAY from the light,
+// invert the corresponding sign (+1 <-> -1).
+constexpr float PAN_DIRECTION = -1.0f;
+constexpr float TILT_DIRECTION = +1.0f;
 
-// ------------------------------------------------
-// 2. PWM CONFIGURATION
-// ------------------------------------------------
-const uint32_t PWM_FREQ = 50;
-const uint8_t PWM_RES = 13;
-const float PWM_PERIOD_US = 1000000.0f / PWM_FREQ;
-const float PWM_DUTY_FULL = (float)(1UL << PWM_RES);
+constexpr float EMA_ALPHA = 0.20f;
+constexpr float DEADBAND = 0.06f;
+constexpr float KP_PAN = 20.0f;   // deg/s per normalized error
+constexpr float KP_TILT = 15.0f;  // deg/s per normalized error
+constexpr float MAX_SPEED_DEG_S = 6.0f;
+constexpr float LIGHT_OFF = 500.0f;  // sum of 4 ADC values
+constexpr float LIGHT_ON = 750.0f;
+constexpr uint32_t CONTROL_MS = 40;
+constexpr uint32_t SERIAL_MS = 200;
+constexpr uint8_t MEDIAN_N = 5;
+constexpr uint16_t ADC_SAMPLE_GAP_US = 150;
 
-// Arduino-ESP32 Core 3.x ledcWrite() uses pin;
-// Core 2.x ledcWrite() uses channel.
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-  #define SERVO_PAN_ID   PIN_SERVO_PAN
-  #define SERVO_TILT_ID  PIN_SERVO_TILT
-#else
-  #define SERVO_PAN_ID   CH_SERVO_PAN
-  #define SERVO_TILT_ID  CH_SERVO_TILT
-#endif
+// Optional suspicious single-channel saturation detection.
+// Only triggers when one LDR is at full scale while the other three
+// together are relatively dark for >2 seconds; not a universal fault test.
+constexpr bool ENABLE_SATURATION_GUARD = true;
+constexpr uint16_t SATURATED_ADC = 4090;
+constexpr float OTHER_THREE_MAX_SUM = 350.0f;
+constexpr uint32_t FAULT_CONFIRM_MS = 2000;
 
-// ------------------------------------------------
-// 3. TRACKER TUNING PARAMETERS
-// ------------------------------------------------
+float raw[4] = {0, 0, 0, 0};
+float filtered[4] = {0, 0, 0, 0};
+float gain[4] = {1, 1, 1, 1}; // calibrate only with controlled uniform light
+float panAngle = PAN_HOME, tiltAngle = TILT_HOME;
+float errPan = 0, errTilt = 0;
+float panSpeed = 0, tiltSpeed = 0;
+bool tracking = false;
+bool sensorFault = false;
+uint32_t suspiciousSince[4] = {0, 0, 0, 0};
+uint32_t lastControl = 0, lastSerial = 0;
 
-// Median sampling
-const uint8_t ADC_SAMPLE_COUNT = 5;
-const uint16_t ADC_SAMPLE_DELAY_US = 150;
-
-// EMA filter: larger = faster response, smaller = smoother
-const float EMA_ALPHA = 0.20f;
-
-// Servo angle limits
-const float ANGLE_MIN = 10.0f;
-const float ANGLE_MAX = 170.0f;
-
-const float HOME_PAN = 90.0f;
-const float HOME_TILT = 40.0f;
-
-// Conservative initial pulse range for SG90.
-// Check your own servo before widening this range.
-const float SERVO_MIN_US = 1000.0f;
-const float SERVO_MAX_US = 2000.0f;
-
-// Normalized error deadband
-const float DEADBAND = 0.05f;
-
-// Minimum total raw ADC reading required for tracking.
-// Increase this if the system moves in dim ambient light.
-const float MIN_LIGHT_SUM = 500.0f;
-
-// Conservative speed limit for initial testing
-const float MAX_SPEED_DEG_S = 8.0f;
-
-// P-only controller: output is commanded servo speed (deg/s)
-const float KP_PAN = 25.0f;
-const float KP_TILT = 25.0f;
-
-// Direction depends on physical installation.
-// If an axis moves AWAY from the light, change its sign.
-const float PAN_DIRECTION = -1.0f;
-const float TILT_DIRECTION = +1.0f;
-
-// Main control loop
-const uint32_t LOOP_INTERVAL_MS = 20;   // 50 Hz
-const uint32_t SERIAL_INTERVAL_MS = 200;
-
-// ------------------------------------------------
-// 4. SENSOR STATE
-// ------------------------------------------------
-enum LdrIndex {
-  LDR_TL = 0,
-  LDR_TR,
-  LDR_BL,
-  LDR_BR,
-  NUM_LDR
-};
-
-const uint8_t LDR_PINS[NUM_LDR] = {
-  PIN_LDR_TL, PIN_LDR_TR, PIN_LDR_BL, PIN_LDR_BR
-};
-
-// Calibration intentionally disabled for initial testing.
-// Set individual gains only after a controlled uniform-light calibration.
-float ldrGain[NUM_LDR] = {1.0f, 1.0f, 1.0f, 1.0f};
-
-float rawLdr[NUM_LDR] = {0.0f, 0.0f, 0.0f, 0.0f};
-float ema[NUM_LDR] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-// ------------------------------------------------
-// 5. SERVO STATE
-// ------------------------------------------------
-float currentPanAngle = HOME_PAN;
-float currentTiltAngle = HOME_TILT;
-
-unsigned long lastLoopTime = 0;
-unsigned long lastSerialTime = 0;
-
-// ------------------------------------------------
-// 6. SENSOR READING: MEDIAN OF 5
-// ------------------------------------------------
-uint16_t readLdrMedian(uint8_t pin) {
-  uint16_t samples[ADC_SAMPLE_COUNT];
-
-  for (uint8_t i = 0; i < ADC_SAMPLE_COUNT; i++) {
-    samples[i] = analogRead(pin);
-    delayMicroseconds(ADC_SAMPLE_DELAY_US);
+uint16_t medianRead(uint8_t pin) {
+  uint16_t a[MEDIAN_N];
+  for (uint8_t i = 0; i < MEDIAN_N; ++i) {
+    a[i] = analogRead(pin);
+    delayMicroseconds(ADC_SAMPLE_GAP_US);
   }
-
-  // Insertion sort (small fixed array)
-  for (uint8_t i = 1; i < ADC_SAMPLE_COUNT; i++) {
-    uint16_t key = samples[i];
-    int8_t j = (int8_t)i - 1;
-
-    while (j >= 0 && samples[j] > key) {
-      samples[j + 1] = samples[j];
-      j--;
-    }
-    samples[j + 1] = key;
+  for (uint8_t i = 1; i < MEDIAN_N; ++i) {
+    uint16_t key = a[i];
+    int j = i - 1;
+    while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; --j; }
+    a[j + 1] = key;
   }
-
-  return samples[ADC_SAMPLE_COUNT / 2];
+  return a[MEDIAN_N / 2];
 }
 
-float readLdr(uint8_t index) {
-  return (float)readLdrMedian(LDR_PINS[index]) * ldrGain[index];
-}
-
-void readAndFilterSensors() {
-  for (uint8_t i = 0; i < NUM_LDR; i++) {
-    rawLdr[i] = readLdr(i);
-
-    ema[i] = EMA_ALPHA * rawLdr[i]
-           + (1.0f - EMA_ALPHA) * ema[i];
+void sampleSensors(bool initialize = false) {
+  for (int i = 0; i < 4; ++i) {
+    raw[i] = medianRead(LDR_PINS[i]) * gain[i];
+    filtered[i] = initialize ? raw[i] :
+      (EMA_ALPHA * raw[i] + (1.0f - EMA_ALPHA) * filtered[i]);
   }
 }
 
-// ------------------------------------------------
-// 7. SERVO PWM OUTPUT
-// ------------------------------------------------
-void servoWrite(uint8_t servoId, float angle) {
-  angle = constrain(angle, ANGLE_MIN, ANGLE_MAX);
-
-  float pulseUs = SERVO_MIN_US
-                + (SERVO_MAX_US - SERVO_MIN_US) * angle / 180.0f;
-
-  uint32_t duty = (uint32_t)(
-    (pulseUs / PWM_PERIOD_US) * PWM_DUTY_FULL
-  );
-
-  ledcWrite(servoId, duty);
-}
-
-// ------------------------------------------------
-// 8. P-ONLY VELOCITY CONTROLLER
-// ------------------------------------------------
-float computeP(float error, float kp) {
-  if (fabsf(error) < DEADBAND) {
-    return 0.0f;
-  }
-
-  return kp * error;
-}
-
-// ------------------------------------------------
-// 9. PWM INITIALIZATION
-// ------------------------------------------------
-bool initializeServoPWM() {
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-
-  bool panOK = ledcAttach(PIN_SERVO_PAN, PWM_FREQ, PWM_RES);
-  bool tiltOK = ledcAttach(PIN_SERVO_TILT, PWM_FREQ, PWM_RES);
-
+bool initPwm() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  bool panOK = ledcAttach(PAN_PIN, PWM_FREQ, PWM_BITS);
+  bool tiltOK = ledcAttach(TILT_PIN, PWM_FREQ, PWM_BITS);
   return panOK && tiltOK;
-
 #else
-
-  ledcSetup(CH_SERVO_PAN, PWM_FREQ, PWM_RES);
-  ledcAttachPin(PIN_SERVO_PAN, CH_SERVO_PAN);
-
-  ledcSetup(CH_SERVO_TILT, PWM_FREQ, PWM_RES);
-  ledcAttachPin(PIN_SERVO_TILT, CH_SERVO_TILT);
-
-  return true;
-
+  double f1 = ledcSetup(PAN_CHANNEL, PWM_FREQ, PWM_BITS);
+  double f2 = ledcSetup(TILT_CHANNEL, PWM_FREQ, PWM_BITS);
+  ledcAttachPin(PAN_PIN, PAN_CHANNEL);
+  ledcAttachPin(TILT_PIN, TILT_CHANNEL);
+  return f1 > 0 && f2 > 0;
 #endif
 }
 
-// ------------------------------------------------
-// 10. SETUP
-// ------------------------------------------------
+void writeServo(uint8_t pin, uint8_t channel, float angle,
+                float minAngle, float maxAngle) {
+  angle = constrain(angle, minAngle, maxAngle);
+  float pulse = PULSE_MIN_US + (PULSE_MAX_US - PULSE_MIN_US) * angle / 180.0f;
+  uint32_t duty = (uint32_t)lroundf((pulse / PWM_PERIOD_US) * PWM_MAX_DUTY);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(pin, duty);
+#else
+  (void)pin;
+  ledcWrite(channel, duty);
+#endif
+}
+
+void outputServos() {
+  writeServo(PAN_PIN, PAN_CHANNEL, panAngle, PAN_MIN, PAN_MAX);
+  writeServo(TILT_PIN, TILT_CHANNEL, tiltAngle, TILT_MIN, TILT_MAX);
+}
+
+float continuousDeadbandP(float error, float kp) {
+  float amount = fabsf(error) - DEADBAND;
+  if (amount <= 0.0f) return 0.0f;
+  return copysignf(kp * amount, error);
+}
+
+bool detectFault(uint32_t now, float rawTotal) {
+  if (!ENABLE_SATURATION_GUARD) return false;
+  bool fault = false;
+  for (int i = 0; i < 4; ++i) {
+    bool suspicious = raw[i] >= SATURATED_ADC &&
+                      (rawTotal - raw[i]) <= OTHER_THREE_MAX_SUM;
+    if (suspicious) {
+      if (suspiciousSince[i] == 0) suspiciousSince[i] = now;
+      if (now - suspiciousSince[i] >= FAULT_CONFIRM_MS) fault = true;
+    } else {
+      suspiciousSince[i] = 0;
+    }
+  }
+  return fault;
+}
+
+void printCsv(uint32_t now, const char *state) {
+  // CSV: DATA,ms,TL,TR,BL,BR,errPan,errTilt,panDeg,tiltDeg,panDegPerS,tiltDegPerS,state
+  Serial.printf("DATA,%lu,%.0f,%.0f,%.0f,%.0f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%s\n",
+    (unsigned long)now, raw[0], raw[1], raw[2], raw[3],
+    errPan, errTilt, panAngle, tiltAngle, panSpeed, tiltSpeed, state);
+}
+
 void setup() {
   Serial.begin(115200);
-  delay(500);
-
-  Serial.println();
-  Serial.println("========================================");
-  Serial.println(" ESP32 DUAL AXIS SOLAR TRACKER");
-  Serial.println(" Improved firmware - 4 LDR + 2 SG90");
-  Serial.println("========================================");
-
-  // ADC configuration
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
+  for (uint8_t pin : LDR_PINS) pinMode(pin, INPUT);
 
-  for (uint8_t i = 0; i < NUM_LDR; i++) {
-    pinMode(LDR_PINS[i], INPUT);
-    ldrGain[i] = 1.0f;
+  if (!initPwm()) {
+    Serial.println("ERROR: servo PWM initialization failed");
+    while (true) delay(1000);
   }
 
-  // Initialize servo PWM
-  if (!initializeServoPWM()) {
-    Serial.println("ERROR: Failed to initialize servo PWM.");
-    while (true) {
-      delay(1000);
-    }
-  }
-
-  // Send servos to home sequentially to reduce simultaneous inrush current
-  currentPanAngle = HOME_PAN;
-  currentTiltAngle = HOME_TILT;
-
-  servoWrite(SERVO_PAN_ID, currentPanAngle);
+  // CAUTION: initial servo commands can move loaded mechanisms abruptly.
+  // Confirm mechanical clearance and manually center before power-up.
+  writeServo(PAN_PIN, PAN_CHANNEL, panAngle, PAN_MIN, PAN_MAX);
+  delay(500);
+  writeServo(TILT_PIN, TILT_CHANNEL, tiltAngle, TILT_MIN, TILT_MAX);
   delay(500);
 
-  servoWrite(SERVO_TILT_ID, currentTiltAngle);
-  delay(500);
-
-  Serial.println("LDR auto-calibration is DISABLED (gain = 1.0).");
-  Serial.println("Keep sensors illuminated normally; starting EMA...");
-
-  // Initialize EMA with actual sensor readings
-  for (uint8_t i = 0; i < NUM_LDR; i++) {
-    rawLdr[i] = readLdr(i);
-    ema[i] = rawLdr[i];
-  }
-
-  lastLoopTime = millis();
-  lastSerialTime = millis();
-
-  Serial.println("System ready.");
-  Serial.println("Monitoring format:");
-  Serial.println("RAW[TL TR BL BR] EMA[TL TR BL BR] ErrH ErrV PAN TILT");
+  sampleSensors(true);
+  lastControl = lastSerial = millis();
+  Serial.println("# Dual Axis Solar Tracker V2 | P velocity controller");
+  Serial.println("# DATA,ms,TL,TR,BL,BR,errPan,errTilt,panDeg,tiltDeg,panDegPerS,tiltDegPerS,state");
+  Serial.println("# state: TRACK / DEADBAND / LOW_LIGHT / SENSOR_FAULT");
 }
 
-// ------------------------------------------------
-// 11. MAIN CONTROL LOOP
-// ------------------------------------------------
 void loop() {
-  unsigned long now = millis();
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastControl) < CONTROL_MS) return;
+  float dt = (uint32_t)(now - lastControl) / 1000.0f;
+  lastControl = now;
+  dt = constrain(dt, 0.001f, 0.10f);
 
-  if (now - lastLoopTime < LOOP_INTERVAL_MS) {
-    return;
+  sampleSensors();
+  float rawTotal = raw[0] + raw[1] + raw[2] + raw[3];
+  float total = filtered[0] + filtered[1] + filtered[2] + filtered[3];
+  sensorFault = detectFault(now, rawTotal);
+
+  // Hysteresis: once stopped, both sums must exceed LIGHT_ON to resume.
+  if (tracking) {
+    if (rawTotal < LIGHT_OFF || total < LIGHT_OFF) tracking = false;
+  } else {
+    if (rawTotal >= LIGHT_ON && total >= LIGHT_ON) tracking = true;
   }
 
-  float dt = (now - lastLoopTime) / 1000.0f;
-  lastLoopTime = now;
+  errPan = 0.0f;
+  errTilt = 0.0f;
+  panSpeed = 0.0f;
+  tiltSpeed = 0.0f;
+  const char *state = "LOW_LIGHT";
 
-  // Guard against an unexpectedly long loop interval
-  if (dt <= 0.0f) {
-    return;
-  }
-  if (dt > 0.1f) {
-    dt = 0.1f;
-  }
+  if (sensorFault) {
+    state = "SENSOR_FAULT";
+  } else if (tracking && total > 0.0f) {
+    float left = filtered[0] + filtered[2];
+    float right = filtered[1] + filtered[3];
+    float top = filtered[0] + filtered[1];
+    float bottom = filtered[2] + filtered[3];
 
-  // STEP 1: Read and filter all four LDRs
-  readAndFilterSensors();
+    // Positive pan error: left brighter. Positive tilt error: top brighter.
+    errPan = (left - right) / total;
+    errTilt = (top - bottom) / total;
 
-  // STEP 2: Calculate light sums
-  const float left = ema[LDR_TL] + ema[LDR_BL];
-  const float right = ema[LDR_TR] + ema[LDR_BR];
+    panSpeed = constrain(continuousDeadbandP(errPan, KP_PAN),
+                         -MAX_SPEED_DEG_S, MAX_SPEED_DEG_S);
+    tiltSpeed = constrain(continuousDeadbandP(errTilt, KP_TILT),
+                          -MAX_SPEED_DEG_S, MAX_SPEED_DEG_S);
 
-  const float top = ema[LDR_TL] + ema[LDR_TR];
-  const float bottom = ema[LDR_BL] + ema[LDR_BR];
+    panAngle = constrain(panAngle + PAN_DIRECTION * panSpeed * dt,
+                         PAN_MIN, PAN_MAX);
+    tiltAngle = constrain(tiltAngle + TILT_DIRECTION * tiltSpeed * dt,
+                          TILT_MIN, TILT_MAX);
 
-  const float filteredTotal = left + right;
-
-  const float rawTotal =
-      rawLdr[LDR_TL] + rawLdr[LDR_TR]
-    + rawLdr[LDR_BL] + rawLdr[LDR_BR];
-
-  float errorPan = 0.0f;
-  float errorTilt = 0.0f;
-
-  // STEP 3: Low-light / signal-loss protection.
-  // If the raw readings are too low, hold the current servo positions.
-  if (rawTotal < MIN_LIGHT_SUM ||
-      filteredTotal < MIN_LIGHT_SUM) {
-
-    servoWrite(SERVO_PAN_ID, currentPanAngle);
-    servoWrite(SERVO_TILT_ID, currentTiltAngle);
-
-    if (now - lastSerialTime >= SERIAL_INTERVAL_MS) {
-      lastSerialTime = now;
-
-      Serial.printf(
-        "LOW LIGHT / INVALID SIGNAL | RawSum: %.0f | "
-        "RAW[%.0f %.0f %.0f %.0f]\n",
-        rawTotal,
-        rawLdr[LDR_TL], rawLdr[LDR_TR],
-        rawLdr[LDR_BL], rawLdr[LDR_BR]
-      );
-    }
-
-    return;
+    state = (panSpeed == 0.0f && tiltSpeed == 0.0f) ? "DEADBAND" : "TRACK";
   }
 
-  // STEP 4: Normalized errors.
-  // Positive ErrH means left side is brighter.
-  // Positive ErrV means top side is brighter.
-  errorPan = (left - right) / filteredTotal;
-  errorTilt = (top - bottom) / filteredTotal;
+  // Servo commands continue holding their last requested positions.
+  outputServos();
 
-  // STEP 5: P-only controller -> requested speed (deg/s)
-  float panSpeed = computeP(errorPan, KP_PAN);
-  float tiltSpeed = computeP(errorTilt, KP_TILT);
-
-  panSpeed = constrain(
-    panSpeed,
-    -MAX_SPEED_DEG_S,
-    MAX_SPEED_DEG_S
-  );
-
-  tiltSpeed = constrain(
-    tiltSpeed,
-    -MAX_SPEED_DEG_S,
-    MAX_SPEED_DEG_S
-  );
-
-  // STEP 6: Update commanded servo positions.
-  // Direction signs must be verified with the real mechanical assembly.
-  currentPanAngle = constrain(
-    currentPanAngle + PAN_DIRECTION * panSpeed * dt,
-    ANGLE_MIN,
-    ANGLE_MAX
-  );
-
-  currentTiltAngle = constrain(
-    currentTiltAngle + TILT_DIRECTION * tiltSpeed * dt,
-    ANGLE_MIN,
-    ANGLE_MAX
-  );
-
-  // STEP 7: Output PWM
-  servoWrite(SERVO_PAN_ID, currentPanAngle);
-  servoWrite(SERVO_TILT_ID, currentTiltAngle);
-
-  // STEP 8: Serial diagnostics
-  if (now - lastSerialTime >= SERIAL_INTERVAL_MS) {
-    lastSerialTime = now;
-
-    Serial.printf(
-      "RAW[TL:%4.0f TR:%4.0f BL:%4.0f BR:%4.0f] "
-      "EMA[TL:%4.0f TR:%4.0f BL:%4.0f BR:%4.0f] "
-      "ErrH:%+.3f ErrV:%+.3f "
-      "PAN:%.1f TILT:%.1f\n",
-
-      rawLdr[LDR_TL],
-      rawLdr[LDR_TR],
-      rawLdr[LDR_BL],
-      rawLdr[LDR_BR],
-
-      ema[LDR_TL],
-      ema[LDR_TR],
-      ema[LDR_BL],
-      ema[LDR_BR],
-
-      errorPan,
-      errorTilt,
-
-      currentPanAngle,
-      currentTiltAngle
-    );
+  if ((uint32_t)(now - lastSerial) >= SERIAL_MS) {
+    lastSerial = now;
+    printCsv(now, state);
   }
 }
